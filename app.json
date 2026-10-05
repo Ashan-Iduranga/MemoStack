@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "MemoStack",
+    "slug": "memostack",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.memostack.memo_stack"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      "expo-font",
+      "expo-splash-screen",
+      "expo-asset",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "MemoStack needs access to your photos so you can add images to notes.",
+          "cameraPermission": "MemoStack needs the camera so you can photograph material for notes.",
+          "microphonePermission": false
+        }
+      ]
+    ],
+    "scheme": "memostack",
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "fc3bef00-5367-4ffd-9e0d-344757cce52a"
+      }
+    }
+  }
+}

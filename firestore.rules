@@ -1,0 +1,258 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+
+    function isShortString(value, maxSize) {
+      return value is string && value.size() <= maxSize;
+    }
+
+    // ---- Profile & gamification (see src/config/gamification.ts) ----
+
+    function pad2(n) {
+      return n < 10 ? '0' + string(n) : string(n);
+    }
+
+    // A calendar day in Asia/Colombo (UTC+05:30) as 'YYYY-MM-DD', `offset`
+    // days from today, by the server clock: the device clock isn't trusted.
+    function colomboDay(offset) {
+      let t = request.time + duration.value(330, 'm') + duration.value(offset, 'd');
+      return string(t.year()) + '-' + pad2(t.month()) + '-' + pad2(t.day());
+    }
+
+    function isPhotoUrl(value) {
+      return value == '' || (isShortString(value, 500) && value.matches('https://.+'));
+    }
+
+    // Limits mirror LIMITS / UNI_YEARS in src/config/profileOptions.ts.
+    function validProfile(d) {
+      return isShortString(d.name, 60) && d.name.size() > 0
+        && isShortString(d.get('university', ''), 100)
+        && isShortString(d.get('degreeProgram', ''), 120)
+        && d.get('uniYear', '') in ['', 'year1', 'year2', 'year3', 'year4', 'graduated']
+        && isShortString(d.get('bio', ''), 160)
+        && isShortString(d.get('location', ''), 60)
+        && isPhotoUrl(d.get('photoURL', ''))
+        && isPhotoUrl(d.get('authPhotoURL', ''));
+    }
+
+    // The retired A/L fields may stay as they are until the app deletes
+    // them, but can never be set or changed.
+    function legacyFieldsOnlyRemoved(before, after) {
+      return !after.diff(before).affectedKeys().hasAny(['alYear', 'alStream'])
+        || (!('alYear' in after) && !('alStream' in after));
+    }
+
+    // Streak/XP changes must be exactly what applyActivity() in
+    // src/gamification/activity.ts produces. Values mirror gamification.ts:
+    // dailyOpen 10, streakBonus 50 every 7 days, noteRead 5,
+    // MAX_READS_PER_DAY 40. (Rules functions allow at most 10 variables,
+    // hence the split.)
+    function dayAdvanced(before, after) {
+      return after.get('lastActiveDate', '') != before.get('lastActiveDate', '');
+    }
+
+    function readAdded(before, after) {
+      let noReads = {'date': '', 'noteIds': []};
+      return after.get('readsToday', noReads) != before.get('readsToday', noReads);
+    }
+
+    // A new active day is only ever today; the streak goes +1 after
+    // yesterday, else restarts at 1. Otherwise streaks stay unchanged.
+    function validDayChange(before, after) {
+      let today = colomboDay(0);
+      let oldDate = before.get('lastActiveDate', '');
+      let oldStreak = before.get('currentStreak', 0);
+      let oldLongest = before.get('longestStreak', 0);
+      let newStreak = after.get('currentStreak', 0);
+      let newLongest = after.get('longestStreak', 0);
+      return dayAdvanced(before, after)
+        ? after.lastActiveDate == today
+          && oldDate < today
+          && newStreak == (oldDate == colomboDay(-1) ? oldStreak + 1 : 1)
+          && newLongest == (newStreak > oldLongest ? newStreak : oldLongest)
+          && after.weekActiveDates is list
+          && after.weekActiveDates.size() <= 7
+        : newStreak == oldStreak && newLongest == oldLongest
+          && after.get('weekActiveDates', []) == before.get('weekActiveDates', []);
+    }
+
+    // At most one more note read today, up to the daily cap.
+    function validReadChange(before, after) {
+      let today = colomboDay(0);
+      let oldReads = before.get('readsToday', {'date': '', 'noteIds': []});
+      let newReads = after.get('readsToday', {'date': '', 'noteIds': []});
+      return !readAdded(before, after) || (newReads.keys().hasOnly(['date', 'noteIds'])
+        && newReads.date == today
+        && newReads.noteIds is list
+        && newReads.noteIds.size() <= 40
+        && newReads.noteIds.size() == (oldReads.date == today ? oldReads.noteIds.size() + 1 : 1));
+    }
+
+    function validXpChange(before, after) {
+      let dayXp = dayAdvanced(before, after)
+        ? 10 + (after.get('currentStreak', 0) % 7 == 0 ? 50 : 0)
+        : 0;
+      let readXp = readAdded(before, after) ? 5 : 0;
+      return after.get('xp', 0) is int
+        && after.get('xp', 0) == before.get('xp', 0) + dayXp + readXp;
+    }
+
+    function validActivityUpdate(before, after) {
+      return validDayChange(before, after)
+        && validReadChange(before, after)
+        && validXpChange(before, after);
+    }
+
+    match /users/{userId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.isAdmin == false
+        && request.resource.data.get('xp', 0) == 0
+        && request.resource.data.get('currentStreak', 0) == 0
+        && request.resource.data.get('longestStreak', 0) == 0
+        && request.resource.data.get('lastActiveDate', '') == ''
+        && request.resource.data.get('weekActiveDates', []).size() == 0
+        && request.resource.data.get('readsToday', {'date': '', 'noteIds': []}).noteIds.size() == 0;
+      // Only the owner, only profile and gamification fields (never
+      // isAdmin/email/createdAt), and XP/streaks only as the app earns them.
+      allow update: if isSignedIn() && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'bio', 'university', 'degreeProgram', 'uniYear', 'location', 'photoURL', 'authPhotoURL',
+          'alYear', 'alStream',
+          'xp', 'currentStreak', 'longestStreak', 'lastActiveDate', 'weekActiveDates', 'readsToday'])
+        && validProfile(request.resource.data)
+        && legacyFieldsOnlyRemoved(resource.data, request.resource.data)
+        && validActivityUpdate(resource.data, request.resource.data);
+      allow delete: if false;
+    }
+
+    // Follow edges, id `{followerUid}_{followeeUid}`. No follow UI yet:
+    // the profile only counts them.
+    match /follows/{followId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['followerUid', 'followeeUid', 'createdAt'])
+        && request.resource.data.followerUid == request.auth.uid
+        && request.resource.data.followeeUid is string
+        && request.resource.data.followeeUid != request.auth.uid
+        && followId == request.auth.uid + '_' + request.resource.data.followeeUid
+        && request.resource.data.createdAt == request.time;
+      allow delete: if isSignedIn() && resource.data.followerUid == request.auth.uid;
+      allow update: if false;
+    }
+
+    // Users can only send feedback; admins read it in the app (You tab).
+    match /feedback/{feedbackId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['uid', 'name', 'type', 'message', 'platform', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && isShortString(request.resource.data.get('name', ''), 60)
+        && request.resource.data.type in ['bug', 'idea', 'other']
+        && isShortString(request.resource.data.message, 2000)
+        && request.resource.data.message.size() > 0
+        && isShortString(request.resource.data.platform, 20)
+        && request.resource.data.createdAt == request.time;
+      allow update, delete: if false;
+    }
+
+    match /noteRequests/{requestId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['subject', 'topic', 'grade', 'details',
+          'requesterUid', 'requesterName', 'voteCount', 'status', 'fulfilledNoteId',
+          'fulfilledNoteTitle', 'createdAt', 'fulfilledAt'])
+        && request.resource.data.requesterUid == request.auth.uid
+        && isShortString(request.resource.data.requesterName, 60)
+        && isShortString(request.resource.data.subject, 80) && request.resource.data.subject.size() > 0
+        && isShortString(request.resource.data.topic, 120) && request.resource.data.topic.size() > 0
+        && isShortString(request.resource.data.grade, 40)
+        && isShortString(request.resource.data.details, 1000)
+        && request.resource.data.voteCount == 0
+        && request.resource.data.status == 'open'
+        && request.resource.data.fulfilledNoteId == ''
+        && request.resource.data.fulfilledNoteTitle == ''
+        && request.resource.data.fulfilledAt == null
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if isSignedIn() && (
+        // Any signed-in user moves voteCount by exactly +/-1 (paired with
+        // their own votes/{uid} write in the same transaction).
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['voteCount'])
+          && (request.resource.data.voteCount == resource.data.voteCount + 1
+            || request.resource.data.voteCount == resource.data.voteCount - 1))
+        ||
+        // The requester or an admin links an existing note to fulfil it.
+        ((resource.data.requesterUid == request.auth.uid || isAdmin())
+          && resource.data.status == 'open'
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'fulfilledNoteId', 'fulfilledNoteTitle', 'fulfilledAt'])
+          && request.resource.data.status == 'fulfilled'
+          && request.resource.data.fulfilledNoteId is string
+          && request.resource.data.fulfilledNoteId.size() > 0
+          && get(/databases/$(database)/documents/notes/$(request.resource.data.fulfilledNoteId)).data.title
+            == request.resource.data.fulfilledNoteTitle
+          && request.resource.data.fulfilledAt == request.time)
+      );
+
+      allow delete: if isSignedIn() && (resource.data.requesterUid == request.auth.uid || isAdmin());
+
+      match /votes/{uid} {
+        allow read: if isSignedIn();
+        allow create, delete: if isSignedIn() && request.auth.uid == uid;
+        allow update: if false;
+      }
+    }
+
+    match /subjects/{subjectId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /notes/{noteId} {
+      allow read: if isSignedIn();
+
+      allow create: if isAdmin()
+        && request.resource.data.authorUid == request.auth.uid
+        && request.resource.data.voteScore == 0
+        && request.resource.data.viewCount == 0;
+
+      allow update: if isSignedIn() && (
+        // Any admin edits content fields (including a module rename
+        // rewriting `subjectName` on every note in it).
+        (isAdmin()
+          && !request.resource.data.diff(resource.data).affectedKeys()
+                .hasAny(['authorUid', 'createdAt', 'voteScore', 'viewCount']))
+        ||
+        // Any signed-in user may bump viewCount by exactly 1 on open.
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewCount'])
+          && request.resource.data.viewCount == resource.data.viewCount + 1)
+        ||
+        // Any signed-in user may move voteScore by exactly +/-1 (paired,
+        // client-side, with their own votes/{uid} write in the same
+        // transaction).
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['voteScore'])
+          && (request.resource.data.voteScore == resource.data.voteScore + 1
+            || request.resource.data.voteScore == resource.data.voteScore - 1))
+      );
+
+      allow delete: if isAdmin();
+
+      match /votes/{uid} {
+        allow read: if isSignedIn();
+        allow create, delete: if isSignedIn() && request.auth.uid == uid;
+        allow update: if false;
+      }
+    }
+  }
+}
