@@ -1,3 +1,4 @@
+import type { Quiz } from '@/models/quiz';
 import type { Note, Subject } from '@/models/types';
 
 /// Routes only carry string params, but some screens are opened with an
@@ -7,6 +8,7 @@ import type { Note, Subject } from '@/models/types';
 /// Firestore if it's missing (e.g. after a reload).
 const notes = new Map<string, Note>();
 const subjects = new Map<string, Subject>();
+const quizzes = new Map<string, Quiz>();
 
 export const handoff = {
   putNote(note: Note) {
@@ -20,5 +22,11 @@ export const handoff = {
   },
   getSubject(id: string): Subject | undefined {
     return subjects.get(id);
+  },
+  putQuiz(quiz: Quiz) {
+    quizzes.set(quiz.id, quiz);
+  },
+  getQuiz(id: string): Quiz | undefined {
+    return quizzes.get(id);
   },
 };

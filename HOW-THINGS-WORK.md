@@ -31,9 +31,9 @@ same commit.
                  │                         │                          │
                  ▼                         ▼                          ▼
           Firebase Auth             Cloud Firestore               Cloudinary
-        (email/password)    users · subjects · notes ·      note images + avatars
-                             noteRequests · feedback ·
-                             follows
+        (email/password)    users · subjects · notes ·      note/quiz images + avatars
+                             quizzes · noteRequests ·
+                             feedback · follows
 ```
 
 **The rule of thumb:** screens don't talk to Firebase directly. They call
@@ -49,24 +49,33 @@ That keeps Firebase details in one layer and makes screens easy to change.
 | --- | --- |
 | `src/app/_layout.tsx` | Root: loads fonts, wraps the app in providers (Theme → Toast → Auth → SavedNotes), picks which routes are reachable based on auth state, and sets each stack screen's header. |
 | `src/app/(tabs)/` | Bottom tabs: **Home** (`index`), **Browse**, **Upload** (`manage`, admins only), **Saved**, **You** (`profile`). The tab layout also runs `useDailyActivity`. |
-| `src/app/note/[id].tsx` | The note reader. |
-| `src/app/subject/[id].tsx` | All notes in one module. |
-| `src/app/edit-note/[id].tsx` | Edit an existing note (reuses `NoteEditor`). |
+| `src/app/browse/[kind].tsx` | Browse → one content kind's module grid (see section 7a). |
+| `src/app/note/[id].tsx` | The reader for notes, activities and practicals. |
+| `src/app/subject/[id].tsx` | One module's items of one kind (`kind` param, notes by default). |
+| `src/app/new-note/[kind].tsx` | Upload → Create: a new note, activity or practical (reuses `NoteEditor`). |
+| `src/app/quiz/[id].tsx` | Take a quiz: intro → questions with instant feedback → results (section 7b). |
+| `src/app/new-quiz.tsx`, `edit-quiz/[id].tsx` | Write or edit a quiz (`QuizEditor`). |
+| `src/app/edit-note/[id].tsx` | Edit an existing note, activity or practical (reuses `NoteEditor`). |
 | `src/app/edit-profile.tsx` | Edit your own profile and photo. |
 | `src/app/feedback.tsx` | Send feedback (bug / idea / other). |
 | `src/app/requests/` | Note requests: list (`index`), form (`new`), detail with upvote and fulfil (`[id]`). |
 | `src/app/login`, `register`, `verify-email` | Auth screens. |
-| `src/screens/NoteEditor.tsx` | Compose/edit a note: title, module, rich body, images, links. |
-| `src/screens/ManageNotesTab.tsx`, `ManageModulesTab.tsx` | Admin lists with edit/delete. |
-| `src/components/` | Shared UI. Profile-specific pieces: `Avatar`, `ProfileWidgets` (stat tiles, streak week, rank card, menu rows), `FeedbackCard` (admin inbox). |
+| `src/screens/NoteEditor.tsx` | Compose/edit a note, activity or practical: title, module, rich body, images, links; plus difficulty, "You'll need" and a hidden answer for activities/practicals. |
+| `src/screens/QuizEditor.tsx` | Compose/edit a quiz: title, description, module, difficulty, and multiple-choice questions. |
+| `src/screens/CreateTab.tsx` | Upload → Create: one tile per content kind. |
+| `src/screens/ManageNotesTab.tsx`, `ManageModulesTab.tsx` | Upload → Library (notes, activities, practicals and quizzes) and Modules: admin lists with edit/delete. |
+| `src/components/` | Shared UI. `ModulePicker` (module dropdown + "Add new module", used by both editors), `QuizWidgets` (quiz card, save button). Profile-specific pieces: `Avatar`, `ProfileWidgets` (stat tiles, streak week, rank card, menu rows), `FeedbackCard` (admin inbox). |
 | `src/editor/` | Rich-text engine — see section 5. |
+| `src/config/contentKinds.ts` | The five content kinds (labels, icons, order), which ones are built yet, and difficulty levels. |
 | `src/config/gamification.ts` | Every XP, streak and level value — see section 9. |
+| `src/config/quiz.ts` | Quiz limits (questions, options, text lengths) and the draft key. |
 | `src/config/profileOptions.ts` | Form choices (university years, degree suggestions, feedback types) and text length limits. |
 | `src/gamification/` | `activity.ts` (what an open/read changes, levels, total XP) and `dates.ts` (Colombo calendar days). Pure, unit-tested. |
 | `src/hooks/useDailyActivity.ts` | Counts "opened the app today" for streaks. |
-| `src/services/` | `AuthProvider`, `notesService`, `subjectsService`, `imagesService`, `SavedNotesProvider`, `readingProgress`, `profileService`, `gamificationService`, `followService`, `feedbackService`, `requestsService`. |
+| `src/services/` | `AuthProvider`, `notesService`, `quizzesService`, `subjectsService`, `imagesService`, `SavedNotesProvider`, `readingProgress`, `profileService`, `gamificationService`, `followService`, `feedbackService`, `requestsService`. |
 | `src/models/types.ts` | `AppUser`, `Subject`, `Note`, `NoteRequest`, `FeedbackItem`, `SavedNote` + Firestore (de)serialisers. |
 | `src/models/delta.ts` | Pure helpers over a note body (find images, strip unsafe images, get text). |
+| `src/models/quiz.ts` | `Quiz`, `QuizQuestion`, `QuizAttempt` + (de)serialisers, validation, shuffling, scoring, best-score logic. |
 | `src/lib/firebase.ts`, `cloudinary.ts` | Service configuration (see section 10). |
 | `firestore.rules` | Server-side security — **the real access control**. |
 | `firestore.indexes.json` | Composite indexes the queries need. |
@@ -101,12 +110,20 @@ users/{uid}                    name, email, university, degreeProgram, uniYear, 
                                photoURL, authPhotoURL, isAdmin, createdAt,
                                xp, currentStreak, longestStreak, lastActiveDate,
                                weekActiveDates, readsToday { date, noteIds }
-subjects/{id}                  name, iconKey, notesCount, order, createdAt     ← "modules" in the UI
-notes/{id}                     title, subjectId, subjectName, authorUid, authorName,
+subjects/{id}                  name, iconKey, notesCount, counts { activity, practical, quiz, paper },
+                               order, createdAt     ← "modules" in the UI
+notes/{id}                     kind ('note' | 'activity' | 'practical'), title, subjectId, subjectName,
+                               authorUid, authorName,
                                contentDelta  ← the note body (Quill Delta, see below)
+                               answerDelta, difficulty, requirements  ← activities / practicals
                                plainText, excerpt, wordCount, readTimeMinutes  ← derived from contentDelta
                                voteScore, viewCount, createdAt, updatedAt
 notes/{id}/votes/{uid}         votedAt     ← one doc per voter; the id makes double-voting impossible
+quizzes/{id}                   title, description, subjectId, subjectName, authorUid, authorName, difficulty,
+                               questions [{ id, text, imageUrl, options[2–6], correctIndex, explanation }],
+                               questionCount, createdAt, updatedAt
+quizzes/{id}/quizAttempts/{uid}  uid, quizId, quizTitle, subjectName, lastScore, bestScore, total,
+                               perfect, attemptCount, firstCompletedAt, updatedAt   ← a student's results
 noteRequests/{id}              subject, topic, grade, details, requesterUid, requesterName,
                                voteCount, status ('open' | 'fulfilled'),
                                fulfilledNoteId, fulfilledNoteTitle, createdAt, fulfilledAt
@@ -117,9 +134,16 @@ follows/{follower}_{followee}  followerUid, followeeUid, createdAt   ← no foll
 
 - `users/{uid}` is readable and writable **only by its owner**. That's why
   feedback and requests store the sender's name themselves.
-- `subjectName` and `notesCount` are **denormalised** copies so lists
-  don't need extra reads. The services keep them in sync inside
-  transactions (publish, move between modules, delete, rename module).
+- `subjectName`, `notesCount` and `counts` are **denormalised** copies so
+  lists don't need extra reads. `notesCount` counts kind `note` only (it
+  predates the other kinds); `counts.<kind>` holds the rest — read both
+  through `countFor(subject, kind)` and name the field with
+  `countField(kind)`. The services keep them in sync inside transactions
+  (publish, move between modules or kinds, delete, rename module).
+- Notes from before kinds existed have no `kind` field. They read as
+  `'note'`, but Firestore queries skip docs missing a field, so the Upload
+  tab runs `NotesService.backfillKinds()` once per admin device (flag
+  `kinds_backfilled_v1` in AsyncStorage) to write `kind: 'note'` on them.
 - `voteScore`, `voteCount` and `viewCount` can only move by ±1 per write —
   enforced by `firestore.rules`, not just the app.
 
@@ -271,35 +295,99 @@ clean them up from the Cloudinary Media Library if needed (each is tagged
 
 ## 7. Publishing and editing a note
 
-`NoteEditor` (the Upload tab's "New note", and `edit-note/[id]`):
+`NoteEditor` (Upload → Create → Note / Activity / Practical, which opens
+`new-note/[kind]`, and `edit-note/[id]`):
 
-1. **Draft autosave** (new notes only): title, module, Delta and
-   `uploads` are written to AsyncStorage 500 ms after the last change and
-   restored when the tab opens again.
-2. **Publish:** the body goes through `withHostedImagesOnly`, then
+1. **Draft autosave** (new items only, one draft per kind — `draftKey`):
+   title, module, both Deltas, difficulty, requirements and `uploads` are
+   written to AsyncStorage 500 ms after the last change and restored when
+   that kind's editor opens again. The Create tiles show "Draft saved".
+   Plain notes keep the old `upload_draft_v1` key.
+2. **Activities and practicals** add an optional difficulty, a second
+   editor for the **answer** (`answerDelta`, hidden in the reader until
+   "Show answer"), and for practicals a "You'll need" line. When editing,
+   the Type chips can move an item to another kind; counts follow.
+   Images in either editor are tracked the same way; cleanup uses
+   `noteImageUrls(note)` (body + answer), never `imageUrlsIn` on the body
+   alone.
+3. **Publish:** the body goes through `withHostedImagesOnly`, then
    validation (needs a title, plus text or an image, plus a module). A
    module typed under "Add new module" is reused if one with that name
    exists. `plainText`, `excerpt`, `wordCount` and `readTimeMinutes` are
    derived from the body.
-3. `NotesService.publishNote` writes the note and bumps the module's
-   `notesCount` in **one transaction**. Transactions need the server, so
+4. `NotesService.publishNote` writes the note and bumps the module's
+   count for its kind in **one transaction**. Transactions need the server, so
    publishing needs a connection. If it fails, the draft is kept and the
    admin is told to retry.
-4. **Edit:** `NotesService.updateNote(next, previous)` saves, moves the
-   module counts if the module changed, and deletes images the edit
-   removed.
+5. **Edit:** `NotesService.updateNote(next, previous)` saves, moves the
+   module counts if the module or kind changed, and deletes images the
+   edit removed.
+
+### 7a. Browse
+
+Browse shows one card per kind in `CONTENT_KINDS` with totals summed from
+the modules' counts (no extra reads). A kind not in `AVAILABLE_KINDS`, or
+with nothing published, shows "Coming soon". Tapping a card opens
+`browse/[kind]`: the module grid, limited to modules holding that kind
+(admins see all). A module opens `subject/[id]?kind=…`, which queries
+`notes` by `subjectId` + `kind` (composite indexes in
+`firestore.indexes.json`) — or, for `kind=quiz`, `quizzes` by `subjectId`.
+Papers are planned as their own collection (`papers`) and aren't built yet.
+
+### 7b. Quizzes
+
+Quizzes live in `quizzes`, not `notes`: they have no rich body, just a
+list of multiple-choice questions stored **on the quiz doc** (answer key
+included), so taking one is a single read and works offline once saved.
+
+- **Writing** (`QuizEditor`, Upload → Create → Quiz, or Library → Edit):
+  title, optional description, module (`ModulePicker`, shared with
+  `NoteEditor`), optional difficulty, then question cards — text, an
+  optional image, 2–6 options with the right one ticked, an optional
+  explanation; reorder and remove. Limits are in `src/config/quiz.ts`;
+  `quizProblem` (`src/models/quiz.ts`) is the validation. New quizzes
+  autosave a draft (`quiz_draft_v1`); question images upload when added
+  and follow the same cleanup rules as note images (section 6), via
+  `quizImageUrls`. `QuizzesService.publishQuiz` writes the quiz and bumps
+  `subjects.counts.quiz` in one transaction; edits and deletes move the
+  count like notes do. Module rename and delete cover quizzes too.
+- **Taking** (`quiz/[id]`): intro (your best score, Start/Retake, save
+  offline) → one question at a time; tapping an option locks it in and
+  immediately shows right/wrong and the explanation → results with a
+  review. `shuffleQuestions` reorders questions and options on every
+  attempt (keeping `correctIndex` pointing at the right option).
+- **Scoring is on the device** (`scoreAnswers`) — there's no backend on
+  the free plan, and the answer key is in the doc anyway. That's fine for
+  self-study; it's why quiz XP is small and capped per quiz.
+- **Results** go to `quizzes/{id}/quizAttempts/{uid}` with a plain merge
+  write (so it queues offline). `nextAttempt` decides the new values:
+  `bestScore` never drops (unless the quiz's length changed — an edited
+  quiz starts a fresh best), `perfect` never resets, `attemptCount` +1.
+  The rules recompute exactly this and check `total` against the quiz's
+  `questionCount`. Deleting a quiz leaves attempts in place (clients
+  can't list other users' docs), so earned XP stays.
+- **XP** is derived, not stored (section 9): the profile counts your
+  attempt docs with a collection-group `count()` over `quizAttempts`
+  (needs the collection-group `uid` index and the `uid + perfect` index
+  in `firestore.indexes.json`). Finishing a quiz also counts as the day's
+  activity for the streak.
 
 ---
 
 ## 8. Reading, voting, and offline notes
 
 - **Reader** (`note/[id].tsx`): gets the note from `handoff` (when the
-  list already had it) or Firestore. Once per visit it bumps `viewCount`
+  list already had it) or Firestore. Activities and practicals show their
+  kind and difficulty tags, "You'll need", and the answer behind a
+  "Show answer" card. Once per visit it bumps `viewCount`
   and records a read for streaks/XP. It shows the upvote toggle (a
   transaction that writes `votes/{uid}` and moves `voteScore` by ±1) and
   renders the body with `QuillViewer`.
 - **Saved offline** (`SavedNotesProvider`): the bookmark button writes the
-  note's JSON **and downloads its images** to the app's documents folder:
+  note's (or quiz's) JSON **and downloads its images** to the app's
+  documents folder. Manifest entries carry `kind: 'note' | 'quiz'`
+  (missing = note); the Saved tab opens quizzes in `quiz/[id]`, which
+  swaps question images for the on-device copies the same way:
 
   ```
   memostack_saved/
@@ -331,9 +419,12 @@ profile doc is a live listener, so edits show immediately.
 | Streak reaching a multiple of 7 days | +50 | stored `xp` |
 | Each published note | +20 | derived from `count()` of your notes |
 | Each net upvote on your notes | +2 | derived from `sum(voteScore)` of your notes |
+| Completing a quiz (first time per quiz) | +15 | derived from `count()` of your `quizAttempts` |
+| Scoring 100% on a quiz (once per quiz) | +10 | derived from `count()` of your attempts with `perfect` |
 
-Upvote and note XP are **derived**, not stored, so a voter never writes
-the author's profile (users can only write their own doc). Unvotes and
+Upvote, note and quiz XP are **derived**, not stored, so a voter never
+writes the author's profile (users can only write their own doc), and
+the user-doc rules don't need to know about quizzes. Unvotes and
 deleted notes correct themselves. Level and rank title are computed from
 total XP and never stored.
 
@@ -455,5 +546,8 @@ firebase emulators:start --only firestore   # try rules locally (needs Java)
 - **Rules tests in the repo:** the rules were checked against the
   emulator with a throwaway script; a committed `@firebase/rules-unit-testing`
   suite would keep them checked.
+- **Quiz answers are readable by any signed-in user** (they're on the
+  quiz doc and scoring is client-side). Hiding them would need a Cloud
+  Function (Blaze plan) to score attempts server-side.
 - **Search** is client-side over the latest 300 notes (fine at this
   scale). A dedicated search service would be needed for thousands of notes.

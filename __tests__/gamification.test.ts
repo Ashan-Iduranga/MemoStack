@@ -117,6 +117,12 @@ describe('display helpers', () => {
     expect(totalXp(30, { notesCount: 0, totalVotes: -4 })).toBe(30);
   });
 
+  test('totalXp adds quiz completions and perfect scores', () => {
+    expect(totalXp(0, { notesCount: 0, totalVotes: 0 }, { completed: 3, perfect: 1 })).toBe(
+      3 * XP.quizCompleted + XP.quizPerfect,
+    );
+  });
+
   test('levelFor picks the level and progress', () => {
     expect(levelFor(0)).toMatchObject({ level: 1, title: LEVELS[0].title, progress: 0 });
     const mid = levelFor((LEVELS[1].minXp + LEVELS[2].minXp) / 2);

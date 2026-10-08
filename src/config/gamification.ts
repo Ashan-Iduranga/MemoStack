@@ -14,6 +14,10 @@ export const XP = {
   noteCreated: 20,
   /// Each net upvote on the user's notes (derived, never stored).
   upvoteReceived: 2,
+  /// Completing a quiz for the first time (derived, never stored).
+  quizCompleted: 15,
+  /// Scoring 100% on a quiz, once per quiz (derived, never stored).
+  quizPerfect: 10,
   /// Reaching a streak that's a multiple of `STREAK_BONUS_EVERY` days.
   streakBonus: 50,
 };

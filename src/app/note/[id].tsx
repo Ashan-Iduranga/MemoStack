@@ -1,24 +1,26 @@
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ScrollView, Text, View } from 'react-native';
 
+import { AppCard } from '@/components/AppCard';
 import { OutlinedButton } from '@/components/Buttons';
 import { Loading, Message } from '@/components/Feedback';
-import { SaveNoteButton } from '@/components/NoteWidgets';
+import { NoteKindTags, SaveNoteButton } from '@/components/NoteWidgets';
 import { TagPill } from '@/components/Pills';
 import { QuillViewer } from '@/editor/QuillViewer';
 import { withImageUrls } from '@/models/delta';
-import { noteBody, type DeltaOp, type Note } from '@/models/types';
+import { hasAnswer, noteBody, type DeltaOp, type Note } from '@/models/types';
 import { useAuth } from '@/services/AuthProvider';
 import { GamificationService } from '@/services/gamificationService';
 import { NotesService } from '@/services/notesService';
 import { useSavedNotes } from '@/services/SavedNotesProvider';
-import { useTheme } from '@/theme/ThemeProvider';
+import { fonts, useTheme } from '@/theme/ThemeProvider';
 import { timeAgo } from '@/utils/format';
 import { handoff } from '@/utils/handoff';
 
 /// Read-only note view: tags, metadata, the formatted body (with images),
-/// and the upvote toggle.
+/// the hidden answer of an activity or practical, and the upvote toggle.
 export default function NoteDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const [note, setNote] = useState<Note | null | undefined>(() => handoff.getNote(id));
@@ -49,13 +51,14 @@ export default function NoteDetailScreen() {
 function NoteBody({ note }: { note: Note }) {
   const { colors, type } = useTheme();
   const uid = useAuth().currentUser?.uid;
-  const body = useReadableBody(note);
+  const readable = useReadableBody(note);
   return (
     <>
       <Stack.Screen options={{ title: note.subjectName }} />
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingVertical: 16 }}>
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
           <TagPill label={note.subjectName} tone="subject" />
+          <NoteKindTags note={note} />
         </View>
         <View style={{ flexDirection: 'row', marginTop: 16 }}>
           <View style={{ width: 5, borderRadius: 3, backgroundColor: colors.accent, marginRight: 12 }} />
@@ -67,8 +70,15 @@ function NoteBody({ note }: { note: Note }) {
             </Text>
           </View>
         </View>
+        {note.kind === 'practical' && note.requirements.trim() !== '' && (
+          <Text style={[type.bodyMedium, { marginTop: 14 }]}>
+            <Text style={{ color: colors.textPrimary, fontFamily: fonts.semibold }}>You&apos;ll need: </Text>
+            {note.requirements}
+          </Text>
+        )}
         <View style={{ height: 1, backgroundColor: colors.divider, marginTop: 20 }} />
-        <View style={{ marginTop: 20 }}>{body != null && <QuillViewer delta={body} />}</View>
+        <View style={{ marginTop: 20 }}>{readable != null && <QuillViewer delta={readable.body} />}</View>
+        {readable != null && hasAnswer(note) && <AnswerReveal answer={readable.answer} />}
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginTop: 32 }}>
           {uid != null && <VoteButton noteId={note.id} uid={uid} />}
           <SaveNoteButton note={note} />
@@ -78,9 +88,35 @@ function NoteBody({ note }: { note: Note }) {
   );
 }
 
-/// The note's body, with images swapped for on-device copies when the
-/// note is saved for offline reading (null while those load).
-function useReadableBody(note: Note): DeltaOp[] | null {
+/// The solution of an activity or practical, hidden until the student
+/// taps "Show answer" so they try it first.
+function AnswerReveal({ answer }: { answer: DeltaOp[] }) {
+  const { colors, type } = useTheme();
+  const [shown, setShown] = useState(false);
+  if (!shown) {
+    return (
+      <AppCard style={{ marginTop: 28, alignItems: 'center', paddingVertical: 20 }}>
+        <MaterialIcons name="lock-outline" size={24} color={colors.textSecondary} />
+        <Text style={[type.bodyMedium, { marginTop: 6, marginBottom: 14 }]}>Answer hidden — try it first.</Text>
+        <OutlinedButton label="Show answer" icon="visibility" onPress={() => setShown(true)} />
+      </AppCard>
+    );
+  }
+  return (
+    <View style={{ marginTop: 28 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+        <MaterialIcons name="check-circle-outline" size={20} color={colors.success} />
+        <Text style={[type.titleMedium, { marginLeft: 6 }]}>Answer</Text>
+      </View>
+      <View style={{ height: 1, backgroundColor: colors.divider, marginTop: 12, marginBottom: 16 }} />
+      <QuillViewer delta={answer} />
+    </View>
+  );
+}
+
+/// The note's body and answer, with images swapped for on-device copies
+/// when the note is saved for offline reading (null while those load).
+function useReadableBody(note: Note): { body: DeltaOp[]; answer: DeltaOp[] } | null {
   const { isSaved, getOfflineImages } = useSavedNotes();
   const saved = isSaved(note.id);
   const [offline, setOffline] = useState<{ noteId: string; images: Record<string, string> } | null>(null);
@@ -102,9 +138,12 @@ function useReadableBody(note: Note): DeltaOp[] | null {
   }, [note.id, saved]);
 
   return useMemo(() => {
-    if (!saved) return noteBody(note);
+    if (!saved) return { body: noteBody(note), answer: note.answerDelta };
     if (offline?.noteId !== note.id) return null;
-    return withImageUrls(noteBody(note), offline.images);
+    return {
+      body: withImageUrls(noteBody(note), offline.images),
+      answer: withImageUrls(note.answerDelta, offline.images),
+    };
   }, [note, saved, offline]);
 }
 

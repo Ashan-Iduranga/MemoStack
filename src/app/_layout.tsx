@@ -73,8 +73,13 @@ function RootNavigator() {
         <Stack.Protected guard={verified}>
           <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
           <Stack.Screen name="note/[id]" options={{ title: '' }} />
+          <Stack.Screen name="browse/[kind]" options={{ title: '', headerBackTitle: 'Browse' }} />
           <Stack.Screen name="subject/[id]" options={{ title: '' }} />
-          <Stack.Screen name="edit-note/[id]" options={{ title: 'Edit note' }} />
+          <Stack.Screen name="edit-note/[id]" options={{ title: 'Edit' }} />
+          <Stack.Screen name="new-note/[kind]" options={{ title: '', headerBackTitle: 'Upload' }} />
+          <Stack.Screen name="quiz/[id]" options={{ title: '' }} />
+          <Stack.Screen name="new-quiz" options={{ title: 'New quiz', headerBackTitle: 'Upload' }} />
+          <Stack.Screen name="edit-quiz/[id]" options={{ title: 'Edit quiz' }} />
           {/* Without `headerBackTitle`, iOS labels the back button with the
               previous route's name, "(tabs)". */}
           <Stack.Screen name="edit-profile" options={{ title: 'Edit profile', headerBackTitle: 'Profile' }} />

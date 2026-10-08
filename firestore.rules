@@ -219,10 +219,94 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
+    // Kind fields of a note / activity / practical; values mirror
+    // NOTE_KINDS and DIFFICULTIES in src/config/contentKinds.ts. Docs from
+    // before kinds existed may lack them.
+    function validNoteKindFields(d) {
+      return d.get('kind', 'note') in ['note', 'activity', 'practical']
+        && d.get('answerDelta', []) is list
+        && d.get('difficulty', '') in ['', 'easy', 'medium', 'hard']
+        && isShortString(d.get('requirements', ''), 300);
+    }
+
+    // ---- Quizzes (limits mirror src/config/quiz.ts) ----
+
+    // Questions aren't checked one by one (rules have no loops); only
+    // admins write quizzes, and the app skips malformed questions.
+    function validQuiz(d) {
+      return d.keys().hasOnly(['title', 'description', 'subjectId', 'subjectName', 'authorUid', 'authorName',
+          'difficulty', 'questions', 'questionCount', 'createdAt', 'updatedAt'])
+        && isShortString(d.title, 120) && d.title.size() > 0
+        && isShortString(d.get('description', ''), 300)
+        && d.get('difficulty', '') in ['', 'easy', 'medium', 'hard']
+        && d.questions is list
+        && d.questions.size() > 0 && d.questions.size() <= 50
+        && d.questionCount == d.questions.size();
+    }
+
+    // A student's own result; `total` must be the quiz's current length.
+    function validAttempt(quizId, d) {
+      let total = get(/databases/$(database)/documents/quizzes/$(quizId)).data.questionCount;
+      return d.keys().hasOnly(['uid', 'quizId', 'quizTitle', 'subjectName', 'lastScore', 'bestScore', 'total',
+          'perfect', 'attemptCount', 'firstCompletedAt', 'updatedAt'])
+        && d.uid == request.auth.uid
+        && d.quizId == quizId
+        && d.total == total
+        && d.lastScore is int && d.lastScore >= 0 && d.lastScore <= total
+        && d.bestScore is int
+        && d.perfect is bool
+        && isShortString(d.quizTitle, 120)
+        && isShortString(d.subjectName, 200)
+        && d.updatedAt == request.time;
+    }
+
+    // Mirrors nextAttempt() in src/models/quiz.ts: best never drops unless
+    // the quiz's length changed; perfect never resets; one attempt per write.
+    function validAttemptChange(before, after) {
+      let sameQuiz = before.total == after.total;
+      let best = sameQuiz && before.bestScore > after.lastScore ? before.bestScore : after.lastScore;
+      return after.bestScore == best
+        && after.perfect == (before.perfect || after.lastScore == after.total)
+        && after.attemptCount == before.attemptCount + 1
+        && after.firstCompletedAt == before.firstCompletedAt;
+    }
+
+    match /quizzes/{quizId} {
+      allow read: if isSignedIn();
+      allow create: if isAdmin()
+        && validQuiz(request.resource.data)
+        && request.resource.data.authorUid == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+      allow update: if isAdmin()
+        && validQuiz(request.resource.data)
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['authorUid', 'createdAt']);
+      allow delete: if isAdmin();
+
+      match /quizAttempts/{uid} {
+        allow read: if isSignedIn() && request.auth.uid == uid;
+        allow create: if isSignedIn() && request.auth.uid == uid
+          && validAttempt(quizId, request.resource.data)
+          && request.resource.data.bestScore == request.resource.data.lastScore
+          && request.resource.data.perfect == (request.resource.data.lastScore == request.resource.data.total)
+          && request.resource.data.attemptCount == 1
+          && request.resource.data.firstCompletedAt == request.time;
+        allow update: if isSignedIn() && request.auth.uid == uid
+          && validAttempt(quizId, request.resource.data)
+          && validAttemptChange(resource.data, request.resource.data);
+        allow delete: if false;
+      }
+    }
+
+    // The profile counts a user's own attempts across all quizzes (quiz XP).
+    match /{path=**}/quizAttempts/{uid} {
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
     match /notes/{noteId} {
       allow read: if isSignedIn();
 
       allow create: if isAdmin()
+        && validNoteKindFields(request.resource.data)
         && request.resource.data.authorUid == request.auth.uid
         && request.resource.data.voteScore == 0
         && request.resource.data.viewCount == 0;
@@ -231,6 +315,7 @@ service cloud.firestore {
         // Any admin edits content fields (including a module rename
         // rewriting `subjectName` on every note in it).
         (isAdmin()
+          && validNoteKindFields(request.resource.data)
           && !request.resource.data.diff(resource.data).affectedKeys()
                 .hasAny(['authorUid', 'createdAt', 'voteScore', 'viewCount']))
         ||

@@ -6,8 +6,9 @@ import { AppCard } from '@/components/AppCard';
 import { OutlinedButton } from '@/components/Buttons';
 import { TagPill } from '@/components/Pills';
 import { useToast } from '@/components/Toast';
+import { difficultyLabel, kindInfo } from '@/config/contentKinds';
 import type { Note } from '@/models/types';
-import { useSavedNotes } from '@/services/SavedNotesProvider';
+import { useSavedNotes, type SaveResult } from '@/services/SavedNotesProvider';
 import { useTheme } from '@/theme/ThemeProvider';
 import { timeAgo } from '@/utils/format';
 
@@ -16,25 +17,48 @@ import { timeAgo } from '@/utils/format';
 /// reader.
 export function SaveNoteButton({ note, compact = false }: { note: Note; compact?: boolean }) {
   const service = useSavedNotes();
+  return (
+    <SaveOfflineButton
+      itemId={note.id}
+      save={() => service.saveNote(note)}
+      savedMessage="Saved for offline reading."
+      compact={compact}
+    />
+  );
+}
+
+/// The bookmark toggle behind `SaveNoteButton` and `SaveQuizButton`.
+export function SaveOfflineButton({
+  itemId,
+  save,
+  savedMessage,
+  compact = false,
+}: {
+  itemId: string;
+  save: () => Promise<SaveResult>;
+  savedMessage: string;
+  compact?: boolean;
+}) {
+  const service = useSavedNotes();
   const toast = useToast();
   const { colors } = useTheme();
   const [busy, setBusy] = useState(false);
-  const saved = service.isSaved(note.id);
+  const saved = service.isSaved(itemId);
 
   const toggle = async () => {
     if (busy) return;
     setBusy(true);
     try {
       if (saved) {
-        await service.removeNote(note.id);
+        await service.removeNote(itemId);
         toast('Removed from saved.');
         return;
       }
-      const result = await service.saveNote(note);
-      if (result === 'saved') toast('Saved for offline reading.');
-      if (result === 'quotaExceeded') toast('Storage limit reached — remove a saved note to free up space.');
+      const result = await save();
+      if (result === 'saved') toast(savedMessage);
+      if (result === 'quotaExceeded') toast('Storage limit reached — remove a saved item to free up space.');
     } catch {
-      toast('Could not update saved notes.');
+      toast('Could not update saved items.');
     } finally {
       setBusy(false);
     }
@@ -71,15 +95,28 @@ export function SaveNoteButton({ note, compact = false }: { note: Note; compact?
   );
 }
 
+/// The kind and difficulty tags of an activity or practical (none for a
+/// plain note).
+export function NoteKindTags({ note }: { note: Note }) {
+  if (note.kind === 'note') return null;
+  return (
+    <>
+      <TagPill label={kindInfo(note.kind).singular.replace(/^./, (c) => c.toUpperCase())} />
+      {note.difficulty !== '' && <TagPill label={difficultyLabel(note.difficulty)} />}
+    </>
+  );
+}
+
 /// A note summary card used in search results and module lists: subject
-/// tag, title, excerpt, and vote/view counts.
+/// (and kind) tags, title, excerpt, and vote/view counts.
 export function NoteListTile({ note, onPress }: { note: Note; onPress: () => void }) {
   const { colors, type } = useTheme();
   return (
     <AppCard onPress={onPress} style={{ marginBottom: 12 }}>
       <View style={styles.row}>
-        <View style={{ flex: 1, flexDirection: 'row' }}>
+        <View style={{ flex: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
           <TagPill label={note.subjectName} tone="subject" />
+          <NoteKindTags note={note} />
         </View>
         <SaveNoteButton note={note} compact />
       </View>

@@ -19,6 +19,7 @@ import { useAuth } from '@/services/AuthProvider';
 import { FollowService } from '@/services/followService';
 import { NotesService, type AuthorStats } from '@/services/notesService';
 import { avatarUrl, ProfileService } from '@/services/profileService';
+import { QuizzesService, type QuizStats } from '@/services/quizzesService';
 import { useTheme } from '@/theme/ThemeProvider';
 import { formatCount } from '@/utils/format';
 import { useSubscription } from '@/utils/useSubscription';
@@ -63,13 +64,14 @@ export default function ProfileScreen() {
 
 interface Extras {
   authored: AuthorStats | null;
+  quizzes: QuizStats | null;
   follows: { followers: number; following: number } | null;
   failed: boolean;
 }
 
-/// Author stats (for derived XP) and follow counts, refreshed on focus.
+/// Author and quiz stats (for derived XP) and follow counts, refreshed on focus.
 function useProfileExtras(uid: string, reloadKey: number): Extras {
-  const [extras, setExtras] = useState<Extras>({ authored: null, follows: null, failed: false });
+  const [extras, setExtras] = useState<Extras>({ authored: null, quizzes: null, follows: null, failed: false });
   useFocusEffect(
     useCallback(() => {
       if (!uid) return;
@@ -81,6 +83,13 @@ function useProfileExtras(uid: string, reloadKey: number): Extras {
       NotesService.getAuthorStats(uid)
         .then((authored) => !cancelled && setExtras((prev) => ({ ...prev, authored, failed: false })))
         .catch(fail);
+      QuizzesService.getUserQuizStats(uid)
+        .then((quizzes) => !cancelled && setExtras((prev) => ({ ...prev, quizzes })))
+        .catch((e) => {
+          // Still show the rest of the XP; the retry banner covers this.
+          if (!cancelled) setExtras((prev) => ({ ...prev, quizzes: prev.quizzes ?? { completed: 0, perfect: 0 } }));
+          fail(e);
+        });
       FollowService.getCounts(uid)
         .then((follows) => !cancelled && setExtras((prev) => ({ ...prev, follows })))
         .catch(fail);
@@ -107,7 +116,8 @@ function ProfileBody({
 }) {
   const { colors, type, isDark, toggle } = useTheme();
   const today = colomboDate();
-  const xp = extras.authored != null ? totalXp(user.xp, extras.authored) : null;
+  const xp =
+    extras.authored != null && extras.quizzes != null ? totalXp(user.xp, extras.authored, extras.quizzes) : null;
   const level = xp != null ? levelFor(xp) : null;
   const education = [
     user.university.length > 0 && { icon: 'school' as const, text: user.university },

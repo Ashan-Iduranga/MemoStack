@@ -1,20 +1,42 @@
-import { useState } from 'react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { useToast } from '@/components/Toast';
+import { CreateTab } from '@/screens/CreateTab';
 import { ManageModulesTab } from '@/screens/ManageModulesTab';
 import { ManageNotesTab } from '@/screens/ManageNotesTab';
-import { NoteEditor } from '@/screens/NoteEditor';
+import { NotesService } from '@/services/notesService';
 import { fonts, useTheme } from '@/theme/ThemeProvider';
 
-const TABS = ['New note', 'Notes', 'Modules'] as const;
+const TABS = ['Create', 'Library', 'Modules'] as const;
 
-/// Admin-only Upload tab: write a new note, or edit/delete existing notes
-/// and modules. All three panes stay mounted so switching tabs keeps the
-/// half-written note and scroll positions.
+/// Set once this device has given every older note `kind: 'note'`.
+const KINDS_BACKFILLED_KEY = 'kinds_backfilled_v1';
+
+/// Admin-only Upload tab: create any kind of material, or edit/delete
+/// what's published and the modules. All three panes stay mounted so
+/// switching tabs keeps scroll positions.
 export default function ManageScreen() {
   const { colors, type } = useTheme();
+  const toast = useToast();
   const [tab, setTab] = useState(0);
+
+  // Notes from before kinds existed have no `kind`, so Browse's per-kind
+  // queries can't see them until this runs (see NotesService.backfillKinds).
+  useEffect(() => {
+    (async () => {
+      try {
+        if ((await AsyncStorage.getItem(KINDS_BACKFILLED_KEY)) != null) return;
+        const updated = await NotesService.backfillKinds();
+        await AsyncStorage.setItem(KINDS_BACKFILLED_KEY, '1');
+        if (updated > 0) toast(`Updated ${updated} older notes for the new Browse.`);
+      } catch {
+        // Offline or rejected: try again next time the tab opens.
+      }
+    })();
+  }, [toast]);
 
   return (
     <SafeAreaView style={{ flex: 1 }} edges={['top']}>
@@ -40,7 +62,7 @@ export default function ManageScreen() {
       </View>
       <View style={{ flex: 1 }}>
         <View style={[styles.pane, tab !== 0 && styles.hidden]}>
-          <NoteEditor />
+          <CreateTab />
         </View>
         <View style={[styles.pane, tab !== 1 && styles.hidden]}>
           <ManageNotesTab />

@@ -14,14 +14,15 @@ import {
 } from 'firebase/firestore';
 
 import { db } from '@/lib/firebase';
-import { imageUrlsIn } from '@/models/delta';
-import { noteFromDoc, subjectFromDoc, type Subject } from '@/models/types';
+import { quizFromDoc, quizImageUrls } from '@/models/quiz';
+import { noteFromDoc, noteImageUrls, subjectFromDoc, type Subject } from '@/models/types';
 
 import { ImagesService } from './imagesService';
 import type { Unsubscribe } from './notesService';
 
 const subjectsCol = () => collection(db, 'subjects');
 const notesCol = () => collection(db, 'notes');
+const quizzesCol = () => collection(db, 'quizzes');
 
 /// Firestore caps a batch at 500 writes.
 async function commitInChunks(writes: ((b: WriteBatch) => void)[]) {
@@ -74,6 +75,7 @@ export const SubjectsService = {
       name: name.trim(),
       iconKey,
       notesCount: 0,
+      counts: {},
       order: 0,
       createdAt: serverTimestamp(),
     });
@@ -88,34 +90,49 @@ export const SubjectsService = {
   },
 
   /// Updates the module and, when the name changes, the denormalized
-  /// `subjectName` on every note in it.
+  /// `subjectName` on every note and quiz in it.
   async updateSubject(subject: Subject, name: string, iconKey: string): Promise<void> {
     const trimmed = name.trim();
     const writes: ((b: WriteBatch) => void)[] = [
       (b) => b.update(doc(db, 'subjects', subject.id), { name: trimmed, iconKey }),
     ];
     if (trimmed !== subject.name) {
-      const notes = await getDocs(query(notesCol(), where('subjectId', '==', subject.id)));
-      for (const d of notes.docs) {
+      const [notes, quizzes] = await Promise.all([
+        getDocs(query(notesCol(), where('subjectId', '==', subject.id))),
+        getDocs(query(quizzesCol(), where('subjectId', '==', subject.id))),
+      ]);
+      for (const d of [...notes.docs, ...quizzes.docs]) {
         writes.push((b) => b.update(d.ref, { subjectName: trimmed, updatedAt: serverTimestamp() }));
       }
     }
     await commitInChunks(writes);
   },
 
-  /// Live note count — the stored `notesCount` can drift for notes added
-  /// by hand in the console, so the delete warning asks Firestore directly.
+  /// Live count of everything in the module (notes, activities,
+  /// practicals, quizzes) — the stored counts can drift for docs added by
+  /// hand in the console, so the delete warning asks Firestore directly.
   async countNotes(subjectId: string): Promise<number> {
-    const snap = await getCountFromServer(query(notesCol(), where('subjectId', '==', subjectId)));
-    return snap.data().count;
+    const [notes, quizzes] = await Promise.all([
+      getCountFromServer(query(notesCol(), where('subjectId', '==', subjectId))),
+      getCountFromServer(query(quizzesCol(), where('subjectId', '==', subjectId))),
+    ]);
+    return notes.data().count + quizzes.data().count;
   },
 
-  /// Deletes the module and every note in it, then those notes' images.
+  /// Deletes the module and every note and quiz in it, then their images.
   async deleteSubject(subjectId: string): Promise<void> {
-    const notes = await getDocs(query(notesCol(), where('subjectId', '==', subjectId)));
-    const writes: ((b: WriteBatch) => void)[] = notes.docs.map((d) => (b: WriteBatch) => b.delete(d.ref));
+    const [notes, quizzes] = await Promise.all([
+      getDocs(query(notesCol(), where('subjectId', '==', subjectId))),
+      getDocs(query(quizzesCol(), where('subjectId', '==', subjectId))),
+    ]);
+    const writes: ((b: WriteBatch) => void)[] = [...notes.docs, ...quizzes.docs].map(
+      (d) => (b: WriteBatch) => b.delete(d.ref),
+    );
     writes.push((b) => b.delete(doc(db, 'subjects', subjectId)));
     await commitInChunks(writes);
-    await ImagesService.deleteAll(notes.docs.flatMap((d) => imageUrlsIn(noteFromDoc(d).contentDelta)));
+    await ImagesService.deleteAll([
+      ...notes.docs.flatMap((d) => noteImageUrls(noteFromDoc(d))),
+      ...quizzes.docs.flatMap((d) => quizImageUrls(quizFromDoc(d))),
+    ]);
   },
 };

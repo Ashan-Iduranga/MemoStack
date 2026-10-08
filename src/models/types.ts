@@ -1,8 +1,9 @@
 import { Timestamp, serverTimestamp, type DocumentSnapshot } from 'firebase/firestore';
 
+import { isDifficulty, isNoteKind, type ContentKind, type Difficulty, type NoteKind } from '@/config/contentKinds';
 import type { ActivityState } from '@/gamification/activity';
 
-import { deltaFromText, textOf } from './delta';
+import { deltaFromText, imageUrlsIn, textOf } from './delta';
 
 type Data = Record<string, unknown>;
 
@@ -93,14 +94,27 @@ export function appUserToMap(
 }
 
 /// A module (e.g. "Data Structures"), doc `subjects/{id}`. Modules are a
-/// flat list — not tied to any university's year/semester structure.
+/// flat list — not tied to any university's year/semester structure, and
+/// shared by every content kind. `notesCount` counts kind 'note' (it
+/// predates the other kinds); `counts` holds the rest.
 export interface Subject {
   id: string;
   name: string;
   iconKey: string;
   notesCount: number;
+  counts: Partial<Record<Exclude<ContentKind, 'note'>, number>>;
   order: number;
   createdAt: Date | null;
+}
+
+/// How many items of `kind` a module holds.
+export function countFor(subject: Subject, kind: ContentKind): number {
+  return kind === 'note' ? subject.notesCount : (subject.counts[kind] ?? 0);
+}
+
+/// The Firestore field holding a module's count of `kind`, for `increment`.
+export function countField(kind: ContentKind): string {
+  return kind === 'note' ? 'notesCount' : `counts.${kind}`;
 }
 
 export function subjectFromDoc(doc: DocumentSnapshot): Subject {
@@ -110,9 +124,21 @@ export function subjectFromDoc(doc: DocumentSnapshot): Subject {
     name: str(data.name),
     iconKey: str(data.iconKey, 'menuBook'),
     notesCount: int(data.notesCount, 0),
+    counts: countsFrom(data.counts),
     order: int(data.order, 0),
     createdAt: date(data.createdAt),
   };
+}
+
+function countsFrom(v: unknown): Subject['counts'] {
+  if (v == null || typeof v !== 'object') return {};
+  const counts: Subject['counts'] = {};
+  for (const [key, value] of Object.entries(v as Data)) {
+    if ((key === 'quiz' || key === 'paper' || key === 'activity' || key === 'practical') && typeof value === 'number') {
+      counts[key] = Math.max(0, Math.trunc(value));
+    }
+  }
+  return counts;
 }
 
 /// A published note, doc `notes/{id}`. The body is a Quill 2 Delta stored
@@ -120,14 +146,22 @@ export function subjectFromDoc(doc: DocumentSnapshot): Subject {
 /// Images are embeds pointing at Cloudinary https URLs; the
 /// `plainText` / `excerpt` / `wordCount` fields are derived from the Delta
 /// at publish time for search and list cards.
+///
+/// Activities and practicals are notes too (`kind`), with an optional
+/// hidden solution (`answerDelta`), a difficulty, and — for practicals —
+/// what's needed (`requirements`). Docs without `kind` are plain notes.
 export interface Note {
   id: string;
+  kind: NoteKind;
   title: string;
   subjectId: string;
   subjectName: string;
   authorUid: string;
   authorName: string;
   contentDelta: DeltaOp[];
+  answerDelta: DeltaOp[];
+  difficulty: Difficulty;
+  requirements: string;
   plainText: string;
   excerpt: string;
   wordCount: number;
@@ -144,12 +178,16 @@ export function noteFromDoc(doc: DocumentSnapshot): Note {
   const data = (doc.data() ?? {}) as Data;
   return {
     id: doc.id,
+    kind: isNoteKind(data.kind) ? data.kind : 'note',
     title: str(data.title),
     subjectId: str(data.subjectId),
     subjectName: str(data.subjectName),
     authorUid: str(data.authorUid),
     authorName: str(data.authorName),
     contentDelta: Array.isArray(data.contentDelta) ? (data.contentDelta as DeltaOp[]) : [],
+    answerDelta: Array.isArray(data.answerDelta) ? (data.answerDelta as DeltaOp[]) : [],
+    difficulty: isDifficulty(data.difficulty) ? data.difficulty : '',
+    requirements: str(data.requirements),
     plainText: str(data.plainText),
     excerpt: str(data.excerpt),
     wordCount: int(data.wordCount, 0),
@@ -174,8 +212,30 @@ export function noteBody(note: Note): DeltaOp[] {
   return note.contentDelta.length > 0 ? note.contentDelta : deltaFromText(note.plainText);
 }
 
+/// Every image a note uses — body and hidden answer. Cleanup and offline
+/// saving go through this, never `imageUrlsIn(contentDelta)` alone.
+export function noteImageUrls(note: Pick<Note, 'contentDelta' | 'answerDelta'>): string[] {
+  return [...new Set([...imageUrlsIn(note.contentDelta), ...imageUrlsIn(note.answerDelta)])];
+}
+
+/// Whether the note has a solution worth a "Show answer" button.
+export function hasAnswer(note: Note): boolean {
+  return textOf(note.answerDelta).trim().length > 0 || imageUrlsIn(note.answerDelta).length > 0;
+}
+
+/// Kind-specific fields, written on create and update alike.
+function noteKindFields(note: Note) {
+  return {
+    kind: note.kind,
+    answerDelta: note.kind === 'note' ? [] : note.answerDelta,
+    difficulty: note.kind === 'note' ? '' : note.difficulty,
+    requirements: note.kind === 'practical' ? note.requirements : '',
+  };
+}
+
 export function noteToCreateMap(note: Note) {
   return {
+    ...noteKindFields(note),
     title: note.title,
     subjectId: note.subjectId,
     subjectName: note.subjectName,
@@ -198,6 +258,7 @@ export function noteToCreateMap(note: Note) {
 /// `hasAny` deny-list for the admin-edit branch.
 export function noteToUpdateMap(note: Note) {
   return {
+    ...noteKindFields(note),
     title: note.title,
     subjectId: note.subjectId,
     subjectName: note.subjectName,
@@ -274,10 +335,13 @@ export function feedbackFromDoc(doc: DocumentSnapshot): FeedbackItem {
   };
 }
 
-/// A locally-cached note for offline reading. Lives only in the saved
-/// notes manifest on the device — never synced to Firestore.
+/// A locally-cached note (or quiz) for offline use. Lives only in the
+/// saved notes manifest on the device — never synced to Firestore.
 export interface SavedNote {
+  /// The note's or quiz's id.
   noteId: string;
+  /// Entries saved before quizzes existed have no kind: they're notes.
+  kind?: 'note' | 'quiz';
   title: string;
   subjectName: string;
   sizeBytes: number;

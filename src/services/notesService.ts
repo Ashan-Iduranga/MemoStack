@@ -15,13 +15,22 @@ import {
   sum,
   updateDoc,
   where,
+  writeBatch,
   FirestoreError,
   type QueryConstraint,
 } from 'firebase/firestore';
 
+import type { NoteKind } from '@/config/contentKinds';
 import { db } from '@/lib/firebase';
-import { imageUrlsIn } from '@/models/delta';
-import { noteDisplayText, noteFromDoc, noteToCreateMap, noteToUpdateMap, type Note } from '@/models/types';
+import {
+  countField,
+  noteDisplayText,
+  noteFromDoc,
+  noteImageUrls,
+  noteToCreateMap,
+  noteToUpdateMap,
+  type Note,
+} from '@/models/types';
 
 import { ImagesService } from './imagesService';
 
@@ -44,17 +53,19 @@ export const NotesService = {
     return onSnapshot(q, (snap) => onData(snap.docs.map(noteFromDoc)), onError);
   },
 
-  /// Browse-by-subject list, sorted by votes ("Top") or recency ("New").
+  /// Browse-by-subject list of one kind, sorted by votes ("Top") or
+  /// recency ("New"). Needs every note to have `kind` (see `backfillKinds`).
   watchBySubject(
     subjectId: string,
-    options: { sortByVotes?: boolean; limit?: number },
+    options: { kind: NoteKind; sortByVotes?: boolean; limit?: number },
     onData: (notes: Note[]) => void,
     onError: OnError,
   ): Unsubscribe {
-    const { sortByVotes = true, limit: max = 50 } = options;
+    const { kind, sortByVotes = true, limit: max = 50 } = options;
     const q = query(
       notesCol(),
       where('subjectId', '==', subjectId),
+      where('kind', '==', kind),
       orderBy(sortByVotes ? 'voteScore' : 'createdAt', 'desc'),
       limit(max),
     );
@@ -88,41 +99,63 @@ export const NotesService = {
     return noteFromDoc(snap);
   },
 
-  /// Publishes a note and bumps its subject's denormalized `notesCount` in
-  /// one atomic transaction.
+  /// Publishes a note and bumps its module's denormalized count for its
+  /// kind (`notesCount` / `counts.<kind>`) in one atomic transaction.
   async publishNote(note: Note): Promise<void> {
     const noteRef = doc(notesCol());
     await runTransaction(db, async (tx) => {
       tx.set(noteRef, noteToCreateMap(note));
-      tx.update(subjectRef(note.subjectId), { notesCount: increment(1) });
+      tx.update(subjectRef(note.subjectId), { [countField(note.kind)]: increment(1) });
     });
   },
 
-  /// Saves an edit. If the note moved to another module, both modules'
-  /// `notesCount` move with it in the same transaction. Images the edit
-  /// removed are deleted from Storage once the save has succeeded.
+  /// Saves an edit. If the note moved to another module or kind, the
+  /// counts move with it in the same transaction. Images the edit removed
+  /// are deleted from Cloudinary once the save has succeeded.
   async updateNote(note: Note, previous: Note): Promise<void> {
     const noteRef = doc(db, 'notes', note.id);
-    if (previous.subjectId === note.subjectId) {
+    if (previous.subjectId === note.subjectId && previous.kind === note.kind) {
       await updateDoc(noteRef, noteToUpdateMap(note));
     } else {
       await runTransaction(db, async (tx) => {
         tx.update(noteRef, noteToUpdateMap(note));
-        tx.update(subjectRef(previous.subjectId), { notesCount: increment(-1) });
-        tx.update(subjectRef(note.subjectId), { notesCount: increment(1) });
+        if (previous.subjectId === note.subjectId) {
+          tx.update(subjectRef(note.subjectId), {
+            [countField(previous.kind)]: increment(-1),
+            [countField(note.kind)]: increment(1),
+          });
+        } else {
+          tx.update(subjectRef(previous.subjectId), { [countField(previous.kind)]: increment(-1) });
+          tx.update(subjectRef(note.subjectId), { [countField(note.kind)]: increment(1) });
+        }
       });
     }
-    const kept = new Set(imageUrlsIn(note.contentDelta));
-    await ImagesService.deleteAll(imageUrlsIn(previous.contentDelta).filter((url) => !kept.has(url)));
+    const kept = new Set(noteImageUrls(note));
+    await ImagesService.deleteAll(noteImageUrls(previous).filter((url) => !kept.has(url)));
   },
 
   /// Deletes the note, its module's count, and then its images.
   async deleteNote(note: Note): Promise<void> {
     await runTransaction(db, async (tx) => {
       tx.delete(doc(db, 'notes', note.id));
-      tx.update(subjectRef(note.subjectId), { notesCount: increment(-1) });
+      tx.update(subjectRef(note.subjectId), { [countField(note.kind)]: increment(-1) });
     });
-    await ImagesService.deleteAll(imageUrlsIn(note.contentDelta));
+    await ImagesService.deleteAll(noteImageUrls(note));
+  },
+
+  /// Gives every note without a `kind` field `kind: 'note'`. Firestore
+  /// queries skip docs missing a field, so Browse's per-kind lists can't
+  /// see older notes until this has run once (admins only; the Upload tab
+  /// calls it). Returns how many notes it updated.
+  async backfillKinds(): Promise<number> {
+    const snap = await getDocs(notesCol());
+    const missing = snap.docs.filter((d) => d.data().kind === undefined);
+    for (let i = 0; i < missing.length; i += 450) {
+      const batch = writeBatch(db);
+      for (const d of missing.slice(i, i + 450)) batch.update(d.ref, { kind: 'note' });
+      await batch.commit();
+    }
+    return missing.length;
   },
 
   /// Bumps once per reader visit — call on mount, not on re-render.

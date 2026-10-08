@@ -1,4 +1,3 @@
-import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -16,12 +15,22 @@ import {
 
 import { PrimaryButton, TextButton } from '@/components/Buttons';
 import { Loading } from '@/components/Feedback';
-import { AppDropdown, AppTextField } from '@/components/Inputs';
+import { AppTextField } from '@/components/Inputs';
 import { LinkDialog } from '@/components/LinkDialog';
+import { ModulePicker, moduleChoice, resolveModule } from '@/components/ModulePicker';
+import { PillChip } from '@/components/Pills';
 import { useToast } from '@/components/Toast';
+import {
+  DIFFICULTIES,
+  isDifficulty,
+  kindInfo,
+  NOTE_KINDS,
+  type Difficulty,
+  type NoteKind,
+} from '@/config/contentKinds';
 import { QuillEditor, type QuillEditorHandle } from '@/editor/QuillEditor';
 import { imageUrlsIn, textOf, withHostedImagesOnly } from '@/models/delta';
-import { noteBody, type DeltaOp, type Note, type Subject } from '@/models/types';
+import { noteBody, noteImageUrls, type DeltaOp, type Note, type Subject } from '@/models/types';
 import { useAuth } from '@/services/AuthProvider';
 import { ImagePermissionError, ImagesService, ImageUploadError, type ImageSource } from '@/services/imagesService';
 import { NotesService } from '@/services/notesService';
@@ -29,41 +38,59 @@ import { SubjectsService } from '@/services/subjectsService';
 import { fonts, useTheme } from '@/theme/ThemeProvider';
 import { useSubscription } from '@/utils/useSubscription';
 
-const NEW_MODULE = '__new_module__';
-const DRAFT_KEY = 'upload_draft_v1';
+/// One autosaved draft per kind. Plain notes keep the original key so a
+/// draft written before kinds existed still restores.
+export const draftKey = (kind: NoteKind) => (kind === 'note' ? 'upload_draft_v1' : `upload_draft_${kind}_v1`);
 
-/// Admin's note composer: title, module, and a rich-text body with images.
-/// With no `note` it writes a new one (embedded in the Upload tab, with an
-/// autosaved local draft); with a `note` it edits that note and goes back
-/// on save. A module typed in via "Add new module" is reused if one with
-/// that name already exists.
+type EditorTarget = 'body' | 'answer';
+
+const capitalize = (word: string) => word.replace(/^./, (c) => c.toUpperCase());
+
+/// Admin's composer for notes, activities and practicals: title, module,
+/// and a rich-text body with images. Activities and practicals add a
+/// difficulty and a second editor for the answer, which students reveal
+/// with a tap; practicals also list what's needed. With no `note` it
+/// writes a new item of `kind` (with an autosaved local draft) and goes
+/// back on publish; with a `note` it edits that note — including moving it
+/// to another kind — and goes back on save. A module typed in via "Add new
+/// module" is reused if one with that name already exists.
 ///
-/// Images upload to Storage the moment they're inserted (the Delta only
-/// ever holds https URLs). Every upload made while composing is tracked in
-/// `uploads`, so ones that end up unused — removed from the text, or the
-/// draft discarded — are deleted again instead of piling up in Storage.
-export function NoteEditor({ note }: { note?: Note }) {
+/// Images upload to Cloudinary the moment they're inserted (the Deltas
+/// only ever hold https URLs). Every upload made while composing is
+/// tracked in `uploads`, so ones that end up unused — removed from the
+/// text, or the draft discarded — are deleted again instead of piling up.
+export function NoteEditor({ note, kind: newKind = 'note' }: { note?: Note; kind?: NoteKind }) {
   const isEditing = note != null;
+  const draftStorageKey = draftKey(newKind);
   const { currentUser } = useAuth();
   const toast = useToast();
   const { colors, type } = useTheme();
   const screen = useWindowDimensions();
   const editor = useRef<QuillEditorHandle>(null);
-  // Timestamp of the latest touch that started inside the editor (toolbar
-  // included). Touch events bubble, so the screen sees that same touch next
-  // and knows not to blur the editor for it.
-  const editorTouch = useRef(-1);
+  const answerEditor = useRef<QuillEditorHandle>(null);
+  const editorFor = (target: EditorTarget) => (target === 'body' ? editor : answerEditor).current;
+  // The latest touch that started inside an editor (toolbar included).
+  // Touch events bubble, so the screen sees that same touch next and knows
+  // not to blur that editor for it.
+  const editorTouch = useRef<{ timestamp: number; target: EditorTarget } | null>(null);
 
+  const [kind, setKind] = useState<NoteKind>(note?.kind ?? newKind);
   const [title, setTitle] = useState(note?.title ?? '');
   const [subjectSelection, setSubjectSelection] = useState<string | null>(note?.subjectId ?? null);
   const [newModuleName, setNewModuleName] = useState('');
   const [delta, setDelta] = useState<DeltaOp[]>(() => (note ? noteBody(note) : []));
   const [plainText, setPlainText] = useState(() => (note ? textOf(noteBody(note)) : ''));
+  const [answerDelta, setAnswerDelta] = useState<DeltaOp[]>(() => note?.answerDelta ?? []);
+  const [answerText, setAnswerText] = useState(() => (note ? textOf(note.answerDelta) : ''));
+  const [difficulty, setDifficulty] = useState<Difficulty>(note?.difficulty ?? '');
+  const [requirements, setRequirements] = useState(note?.requirements ?? '');
   const [uploads, setUploads] = useState<string[]>([]);
   const [restoringDraft, setRestoringDraft] = useState(!isEditing);
   const [publishing, setPublishing] = useState(false);
   const [imageBusy, setImageBusy] = useState(false);
-  const [linkDialog, setLinkDialog] = useState<{ currentUrl: string | null } | null>(null);
+  const [linkDialog, setLinkDialog] = useState<{ currentUrl: string | null; target: EditorTarget } | null>(null);
+  const hasAnswerSection = kind !== 'note';
+  const singular = kindInfo(kind).singular;
 
   const modules = useSubscription<Subject[]>((onData, onError) => SubjectsService.watchSubjects(onData, onError), []);
   const currentModules = modules.data ?? [];
@@ -73,7 +100,7 @@ export function NoteEditor({ note }: { note?: Note }) {
     if (isEditing) return;
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem(DRAFT_KEY);
+        const raw = await AsyncStorage.getItem(draftStorageKey);
         if (raw) {
           const data = JSON.parse(raw) as Record<string, unknown>;
           setTitle(typeof data.title === 'string' ? data.title : '');
@@ -84,24 +111,41 @@ export function NoteEditor({ note }: { note?: Note }) {
             setDelta(data.delta as DeltaOp[]);
             setPlainText(textOf(data.delta as DeltaOp[]));
           }
+          if (Array.isArray(data.answerDelta) && data.answerDelta.length > 0) {
+            setAnswerDelta(data.answerDelta as DeltaOp[]);
+            setAnswerText(textOf(data.answerDelta as DeltaOp[]));
+          }
+          setDifficulty(isDifficulty(data.difficulty) ? data.difficulty : '');
+          setRequirements(typeof data.requirements === 'string' ? data.requirements : '');
         }
       } catch {
         // Corrupt or old-shape draft — start fresh instead of crashing.
       }
       setRestoringDraft(false);
     })();
-  }, [isEditing]);
+  }, [isEditing, draftStorageKey]);
 
   // Debounced draft save, 500ms after the last change.
   useEffect(() => {
     if (isEditing || restoringDraft) return;
     const timer = setTimeout(() => {
-      AsyncStorage.setItem(DRAFT_KEY, JSON.stringify({ title, subjectSelection, newModuleName, delta, uploads })).catch(
-        () => {},
-      );
+      const draft = { title, subjectSelection, newModuleName, delta, answerDelta, difficulty, requirements, uploads };
+      AsyncStorage.setItem(draftStorageKey, JSON.stringify(draft)).catch(() => {});
     }, 500);
     return () => clearTimeout(timer);
-  }, [isEditing, restoringDraft, title, subjectSelection, newModuleName, delta, uploads]);
+  }, [
+    isEditing,
+    restoringDraft,
+    draftStorageKey,
+    title,
+    subjectSelection,
+    newModuleName,
+    delta,
+    answerDelta,
+    difficulty,
+    requirements,
+    uploads,
+  ]);
 
   // Editing has no draft: leaving without saving deletes this visit's uploads.
   const uploadsRef = useRef(uploads);
@@ -115,10 +159,13 @@ export function NoteEditor({ note }: { note?: Note }) {
     };
   }, [isEditing]);
 
-  // The editor's keyboard belongs to its WebView, which tapping elsewhere
-  // doesn't blur — so any touch outside the editor blurs it explicitly.
+  // An editor's keyboard belongs to its WebView, which tapping elsewhere
+  // doesn't blur — so any touch outside an editor blurs it explicitly.
   const onScreenTouch = (e: GestureResponderEvent) => {
-    if (e.nativeEvent.timestamp !== editorTouch.current) editor.current?.blur();
+    const touch = editorTouch.current;
+    const touched = touch?.timestamp === e.nativeEvent.timestamp ? touch.target : null;
+    if (touched !== 'body') editor.current?.blur();
+    if (touched !== 'answer') answerEditor.current?.blur();
   };
 
   const onEditorChange = useCallback((nextDelta: DeltaOp[], text: string) => {
@@ -126,7 +173,12 @@ export function NoteEditor({ note }: { note?: Note }) {
     setPlainText(text);
   }, []);
 
-  const addImage = async (source: ImageSource) => {
+  const onAnswerChange = useCallback((nextDelta: DeltaOp[], text: string) => {
+    setAnswerDelta(nextDelta);
+    setAnswerText(text);
+  }, []);
+
+  const addImage = async (source: ImageSource, target: EditorTarget) => {
     if (!currentUser) return;
     setImageBusy(true);
     try {
@@ -134,7 +186,7 @@ export function NoteEditor({ note }: { note?: Note }) {
       if (localUri == null) return;
       const url = await ImagesService.upload(localUri, currentUser.uid);
       setUploads((prev) => [...prev, url]);
-      editor.current?.insertImage(url);
+      editorFor(target)?.insertImage(url);
     } catch (e) {
       if (!(e instanceof ImagePermissionError || e instanceof ImageUploadError)) console.warn('Adding image failed', e);
       toast(
@@ -151,29 +203,34 @@ export function NoteEditor({ note }: { note?: Note }) {
 
   // A native alert rather than a custom sheet: iOS can't present the
   // picker while a React Native modal is still animating closed.
-  const chooseImageSource = () => {
+  const chooseImageSource = (target: EditorTarget) => {
     Alert.alert('Add image', undefined, [
-      { text: 'Choose from library', onPress: () => addImage('library') },
-      { text: 'Take photo', onPress: () => addImage('camera') },
+      { text: 'Choose from library', onPress: () => addImage('library', target) },
+      { text: 'Take photo', onPress: () => addImage('camera', target) },
       { text: 'Cancel', style: 'cancel' },
     ]);
   };
 
-  /// Deletes this session's uploads that the final body doesn't use.
-  const cleanUpUploads = (finalDelta: DeltaOp[]) => {
-    const used = new Set(imageUrlsIn(finalDelta));
+  /// Deletes this session's uploads that the final body and answer don't use.
+  const cleanUpUploads = (final: Pick<Note, 'contentDelta' | 'answerDelta'>) => {
+    const used = new Set(noteImageUrls(final));
     ImagesService.deleteAll(uploads.filter((url) => !used.has(url)));
     setUploads([]);
   };
 
   const resetDraft = async () => {
-    await AsyncStorage.removeItem(DRAFT_KEY);
+    await AsyncStorage.removeItem(draftStorageKey);
     setTitle('');
     setNewModuleName('');
     setSubjectSelection(null);
     setDelta([]);
     setPlainText('');
+    setAnswerDelta([]);
+    setAnswerText('');
+    setDifficulty('');
+    setRequirements('');
     editor.current?.setContents([]);
+    answerEditor.current?.setContents([]);
   };
 
   const discardDraft = () => {
@@ -183,7 +240,7 @@ export function NoteEditor({ note }: { note?: Note }) {
         text: 'Discard',
         style: 'destructive',
         onPress: () => {
-          cleanUpUploads([]);
+          cleanUpUploads({ contentDelta: [], answerDelta: [] });
           resetDraft();
         },
       },
@@ -193,43 +250,37 @@ export function NoteEditor({ note }: { note?: Note }) {
   const publish = async () => {
     if (!currentUser) return;
     editor.current?.blur();
+    answerEditor.current?.blur();
     const content = withHostedImagesOnly(delta);
+    const answer = hasAnswerSection ? withHostedImagesOnly(answerDelta) : [];
+    // An answer of only whitespace counts as none (no "Show answer").
+    const answerContent = answerText.trim().length > 0 || imageUrlsIn(answer).length > 0 ? answer : [];
     const trimmedTitle = title.trim();
     const body = plainText.trim();
     if (trimmedTitle.length === 0) return toast('Please add a title.');
-    if (body.length === 0 && imageUrlsIn(content).length === 0) return toast('Please write some note content.');
+    if (body.length === 0 && imageUrlsIn(content).length === 0) return toast(`Please write the ${singular} content.`);
+    if (requirements.trim().length > 300) return toast('Keep "You\'ll need" under 300 characters.');
 
-    const validIds = new Set(currentModules.map((s) => s.id));
-    const pickingNew = subjectSelection == null || subjectSelection === NEW_MODULE || !validIds.has(subjectSelection);
-    let moduleName: string;
-    let existingSubjectId: string | null = null;
-    if (pickingNew) {
-      if (subjectSelection !== NEW_MODULE && subjectSelection != null) return toast('Please choose a module.');
-      moduleName = newModuleName.trim();
-      if (moduleName.length === 0) return toast('Please choose or name a module.');
-    } else {
-      const match = currentModules.find((s) => s.id === subjectSelection)!;
-      existingSubjectId = match.id;
-      moduleName = match.name;
-    }
+    const choice = moduleChoice(currentModules, subjectSelection, newModuleName);
+    if ('problem' in choice) return toast(choice.problem);
 
     setPublishing(true);
     try {
-      const subjectId = existingSubjectId ?? (await SubjectsService.findOrCreateSubject(moduleName));
-      if (existingSubjectId == null) {
-        // Pick up the existing module's exact spelling if one matched.
-        moduleName = (await SubjectsService.getSubject(subjectId))?.name ?? moduleName;
-      }
+      const { subjectId, subjectName } = await resolveModule(choice);
 
       const wordCount = body.length === 0 ? 0 : body.split(/\s+/).length;
       const next: Note = {
         id: note?.id ?? '',
+        kind,
         title: trimmedTitle,
         subjectId,
-        subjectName: moduleName,
+        subjectName,
         authorUid: note?.authorUid ?? currentUser.uid,
         authorName: note?.authorName ?? currentUser.name,
         contentDelta: content,
+        answerDelta: answerContent,
+        difficulty: kind === 'note' ? '' : difficulty,
+        requirements: kind === 'practical' ? requirements.trim() : '',
         plainText: body,
         excerpt: body.length > 160 ? `${body.substring(0, 160)}…` : body,
         wordCount,
@@ -242,17 +293,18 @@ export function NoteEditor({ note }: { note?: Note }) {
 
       if (note) {
         await NotesService.updateNote(next, note);
-        cleanUpUploads(content);
+        cleanUpUploads(next);
         uploadsRef.current = [];
         router.back();
-        toast('Note updated.');
+        toast(`${capitalize(singular)} updated.`);
         return;
       }
 
       await NotesService.publishNote(next);
-      cleanUpUploads(content);
+      cleanUpUploads(next);
       await resetDraft();
-      toast('Note published.');
+      if (router.canGoBack()) router.back();
+      toast(`${capitalize(singular)} published.`);
     } catch {
       toast(
         isEditing
@@ -266,13 +318,8 @@ export function NoteEditor({ note }: { note?: Note }) {
 
   if (restoringDraft) return <Loading />;
 
-  const dropdownValue =
-    subjectSelection === NEW_MODULE || (subjectSelection != null && currentModules.some((s) => s.id === subjectSelection))
-      ? subjectSelection
-      : null;
-  const moduleLabel = (id: string) =>
-    id === NEW_MODULE ? 'Add new module' : (currentModules.find((s) => s.id === id)?.name ?? '');
-  const hasDraft = title.length > 0 || plainText.trim().length > 0 || uploads.length > 0;
+  const hasDraft =
+    title.length > 0 || plainText.trim().length > 0 || answerText.trim().length > 0 || uploads.length > 0;
 
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -289,55 +336,100 @@ export function NoteEditor({ note }: { note?: Note }) {
             {hasDraft && <TextButton label="Discard" color={colors.danger} onPress={discardDraft} />}
           </View>
         )}
+        {isEditing && (
+          <>
+            <Text style={styles.label(colors.textPrimary)}>Type</Text>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 }}>
+              {NOTE_KINDS.map((k) => (
+                <PillChip key={k} label={kindInfo(k).label} selected={kind === k} onPress={() => setKind(k)} />
+              ))}
+            </View>
+          </>
+        )}
         <Text style={styles.label(colors.textPrimary)}>Title</Text>
         <AppTextField value={title} onChangeText={setTitle} placeholder="Hash tables — collision handling" />
 
         <Text style={[styles.label(colors.textPrimary), { marginTop: 20 }]}>Module</Text>
-        <AppDropdown<string>
-          value={dropdownValue}
-          items={[...currentModules.map((s) => s.id), NEW_MODULE]}
-          itemLabel={moduleLabel}
-          placeholder={modules.waiting && modules.data === undefined ? 'Loading modules…' : 'Select a module'}
-          onChange={setSubjectSelection}
-          renderItem={(id) =>
-            id === NEW_MODULE ? (
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                <MaterialIcons name="add-circle-outline" size={18} color={colors.accent} />
-                <Text style={[type.bodyLarge, { marginLeft: 6, color: colors.accent }]}>Add new module</Text>
-              </View>
-            ) : (
-              <Text style={type.bodyLarge} numberOfLines={1}>
-                {moduleLabel(id)}
-              </Text>
-            )
-          }
+        <ModulePicker
+          modules={currentModules}
+          loading={modules.waiting && modules.data === undefined}
+          selection={subjectSelection}
+          onSelect={setSubjectSelection}
+          newName={newModuleName}
+          onNewName={setNewModuleName}
         />
-        {dropdownValue === NEW_MODULE && (
-          <AppTextField
-            value={newModuleName}
-            onChangeText={setNewModuleName}
-            placeholder="New module name, e.g. Data Structures"
-            autoCapitalize="words"
-            style={{ marginTop: 10 }}
-          />
+
+        {hasAnswerSection && (
+          <>
+            <Text style={[styles.label(colors.textPrimary), { marginTop: 20 }]}>Difficulty (optional)</Text>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+              {DIFFICULTIES.map((d) => (
+                <PillChip
+                  key={d.key}
+                  label={d.label}
+                  selected={difficulty === d.key}
+                  onPress={() => setDifficulty(difficulty === d.key ? '' : d.key)}
+                />
+              ))}
+            </View>
+          </>
+        )}
+        {kind === 'practical' && (
+          <>
+            <Text style={[styles.label(colors.textPrimary), { marginTop: 20 }]}>You&apos;ll need (optional)</Text>
+            <AppTextField
+              value={requirements}
+              onChangeText={setRequirements}
+              placeholder="e.g. Python 3, VS Code, a breadboard"
+            />
+          </>
         )}
 
-        <Text style={[styles.label(colors.textPrimary), { marginTop: 20 }]}>Note</Text>
-        <View onTouchStart={(e) => (editorTouch.current = e.nativeEvent.timestamp)}>
+        <Text style={[styles.label(colors.textPrimary), { marginTop: 20 }]}>
+          {kind === 'note' ? 'Note' : kind === 'activity' ? 'Task' : 'Instructions'}
+        </Text>
+        <View onTouchStart={(e) => (editorTouch.current = { timestamp: e.nativeEvent.timestamp, target: 'body' })}>
           <QuillEditor
             ref={editor}
             initialDelta={delta}
-            placeholder="Type your notes. Use the toolbar for headings, lists, links and images."
-            height={Math.max(300, Math.round(screen.height * 0.5))}
+            placeholder={
+              kind === 'note'
+                ? 'Type your notes. Use the toolbar for headings, lists, links and images.'
+                : `Describe the ${singular}. Use the toolbar for headings, lists, links and images.`
+            }
+            height={Math.max(300, Math.round(screen.height * (hasAnswerSection ? 0.4 : 0.5)))}
             imageBusy={imageBusy}
             onChange={onEditorChange}
-            onRequestImage={chooseImageSource}
-            onRequestLink={(currentUrl) => setLinkDialog({ currentUrl })}
+            onRequestImage={() => chooseImageSource('body')}
+            onRequestLink={(currentUrl) => setLinkDialog({ currentUrl, target: 'body' })}
           />
         </View>
 
+        {hasAnswerSection && (
+          <>
+            <Text style={[styles.label(colors.textPrimary), { marginTop: 20, marginBottom: 2 }]}>Answer (optional)</Text>
+            <Text style={[type.bodySmall, { color: colors.tagUniversityText, marginBottom: 8 }]}>
+              Hidden from students until they tap &quot;Show answer&quot;.
+            </Text>
+            <View
+              onTouchStart={(e) => (editorTouch.current = { timestamp: e.nativeEvent.timestamp, target: 'answer' })}
+            >
+              <QuillEditor
+                ref={answerEditor}
+                initialDelta={answerDelta}
+                placeholder="The solution, worked steps or expected output."
+                height={Math.max(240, Math.round(screen.height * 0.3))}
+                imageBusy={imageBusy}
+                onChange={onAnswerChange}
+                onRequestImage={() => chooseImageSource('answer')}
+                onRequestLink={(currentUrl) => setLinkDialog({ currentUrl, target: 'answer' })}
+              />
+            </View>
+          </>
+        )}
+
         <PrimaryButton
-          label={isEditing ? 'Save changes' : 'Publish note'}
+          label={isEditing ? 'Save changes' : `Publish ${singular}`}
           loading={publishing}
           onPress={imageBusy ? null : publish}
           style={{ marginTop: 20 }}
@@ -348,7 +440,7 @@ export function NoteEditor({ note }: { note?: Note }) {
         <LinkDialog
           currentUrl={linkDialog.currentUrl}
           onClose={() => setLinkDialog(null)}
-          onSubmit={(url, text) => editor.current?.setLink(url, text)}
+          onSubmit={(url, text) => editorFor(linkDialog.target)?.setLink(url, text)}
         />
       )}
     </KeyboardAvoidingView>

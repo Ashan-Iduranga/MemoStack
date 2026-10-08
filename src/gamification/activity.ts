@@ -79,9 +79,20 @@ export function weekDays(
 }
 
 /// Stored activity XP plus XP derived from the user's notes and the
-/// upvotes on them (derived so voters never write the author's profile).
-export function totalXp(storedXp: number, authored: { notesCount: number; totalVotes: number }): number {
-  return storedXp + XP.noteCreated * authored.notesCount + XP.upvoteReceived * Math.max(0, authored.totalVotes);
+/// upvotes on them (derived so voters never write the author's profile),
+/// and from the quizzes they've completed (counted from their attempts).
+export function totalXp(
+  storedXp: number,
+  authored: { notesCount: number; totalVotes: number },
+  quizzes: { completed: number; perfect: number } = { completed: 0, perfect: 0 },
+): number {
+  return (
+    storedXp +
+    XP.noteCreated * authored.notesCount +
+    XP.upvoteReceived * Math.max(0, authored.totalVotes) +
+    XP.quizCompleted * quizzes.completed +
+    XP.quizPerfect * quizzes.perfect
+  );
 }
 
 export interface LevelInfo {

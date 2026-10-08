@@ -7,12 +7,21 @@ import { OutlinedButton, PrimaryButton, TextButton } from '@/components/Buttons'
 import { ActionSheet, Loading, Message } from '@/components/Feedback';
 import { AppTextField } from '@/components/Inputs';
 import { useToast } from '@/components/Toast';
-import type { Subject } from '@/models/types';
+import { CONTENT_KINDS, countLabel } from '@/config/contentKinds';
+import { countFor, type Subject } from '@/models/types';
 import { SubjectsService } from '@/services/subjectsService';
 import { useTheme } from '@/theme/ThemeProvider';
 import { plural } from '@/utils/format';
 import { subjectIconFor, subjectIcons } from '@/utils/subjectIcons';
 import { useSubscription } from '@/utils/useSubscription';
+
+/// "3 notes · 1 activity", or "Empty".
+function contentsLabel(subject: Subject): string {
+  const parts = CONTENT_KINDS.filter((k) => countFor(subject, k.key) > 0).map((k) =>
+    countLabel(countFor(subject, k.key), k.key),
+  );
+  return parts.length === 0 ? 'Empty' : parts.join(' · ');
+}
 
 /// Every module with Add / Edit (name + icon) / Delete. Renaming updates
 /// the module name on all its notes; deleting removes its notes too.
@@ -50,7 +59,7 @@ export function ManageModulesTab() {
       `Delete "${subject.name}"?`,
       noteCount === 0
         ? 'This module has no notes.'
-        : `This also deletes its ${plural(noteCount, 'note')} for everyone. This can't be undone.`,
+        : `This also deletes everything in it (${plural(noteCount, 'item')}) for everyone. This can't be undone.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -85,7 +94,7 @@ export function ManageModulesTab() {
               <MaterialIcons name={subjectIconFor(subject.iconKey)} size={24} color={colors.accent} />
               <View style={{ flex: 1, marginLeft: 12 }}>
                 <Text style={type.titleMedium}>{subject.name}</Text>
-                <Text style={type.bodySmall}>{plural(subject.notesCount, 'note')}</Text>
+                <Text style={type.bodySmall}>{contentsLabel(subject)}</Text>
               </View>
               <Pressable onPress={() => setMenuFor(subject)} hitSlop={8} style={{ padding: 8 }} accessibilityLabel="Module actions">
                 <MaterialIcons name="more-vert" size={22} color={colors.textSecondary} />
